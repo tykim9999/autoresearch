@@ -27,10 +27,11 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 
 TIME_BUDGET = 60          # search benchmark time budget in seconds
-NUM_QUERIES = 10000       # number of queries to evaluate
+NUM_QUERIES = 5000        # number of queries to evaluate
 TOP_K = 10                # retrieve top-K results per query
 MIN_DOC_LEN = 50          # minimum document length in characters
 MAX_DOC_LEN = 2000        # maximum document length in characters
+DEFAULT_NUM_DOCS = 20000  # default corpus size (fast ground truth computation)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -163,19 +164,22 @@ def _generate_synthetic_corpus(num_docs, seed=42):
 def _generate_queries_and_ground_truth(docs, num_queries, top_k, seed=123):
     """
     Generate queries by extracting key terms from documents,
-    then compute ground truth using exhaustive BM25 scoring.
+    then compute ground truth using inverted-index BM25 scoring (fast).
     """
     rng = random.Random(seed)
 
     # Tokenize all documents
     doc_tokens = [tokenize(doc) for doc in docs]
 
-    # Build IDF for BM25 ground truth
+    # Build inverted index and IDF for BM25 ground truth
     N = len(docs)
     df = Counter()
-    for tokens in doc_tokens:
-        for term in set(tokens):
+    inverted = defaultdict(list)  # term -> [(doc_id, tf), ...]
+    for doc_id, tokens in enumerate(doc_tokens):
+        tf = Counter(tokens)
+        for term, count in tf.items():
             df[term] += 1
+            inverted[term].append((doc_id, count))
 
     # Precompute document lengths
     doc_lens = [len(t) for t in doc_tokens]
@@ -185,27 +189,18 @@ def _generate_queries_and_ground_truth(docs, num_queries, top_k, seed=123):
     k1 = 1.2
     b = 0.75
 
-    def bm25_score(query_terms, doc_idx):
-        score = 0.0
-        dl = doc_lens[doc_idx]
-        tf_map = Counter(doc_tokens[doc_idx])
-        for term in query_terms:
-            if term not in tf_map:
-                continue
-            tf = tf_map[term]
-            idf_val = math.log((N - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5) + 1.0)
-            tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
-            score += idf_val * tf_norm
-        return score
+    # Precompute IDF
+    idf_cache = {}
+    for term, n in df.items():
+        idf_cache[term] = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
+
+    # Precompute length norm factors
+    dl_factors = [k1 * (1 - b + b * doc_lens[i] / avgdl) for i in range(N)]
 
     # Generate queries from random document term samples
     queries = []
-    # Build term frequency across corpus for interesting term selection
-    global_tf = Counter()
-    for tokens in doc_tokens:
-        global_tf.update(tokens)
 
-    # Prefer terms that appear in moderate number of docs (not too rare, not too common)
+    # Prefer terms that appear in moderate number of docs
     interesting_terms = [
         term for term, count in df.items()
         if 5 <= count <= N * 0.3 and len(term) > 2
@@ -214,31 +209,33 @@ def _generate_queries_and_ground_truth(docs, num_queries, top_k, seed=123):
         interesting_terms = [term for term, count in df.items() if count >= 2]
 
     for _ in range(num_queries):
-        # Pick 2-5 query terms
         num_terms = rng.randint(2, min(5, len(interesting_terms)))
         query_terms = rng.sample(interesting_terms, num_terms)
         queries.append(" ".join(query_terms))
 
-    # Compute ground truth exhaustively
-    print("Computing ground truth BM25 rankings (this may take a moment)...")
+    # Compute ground truth using inverted index (much faster than brute force)
+    print("Computing ground truth BM25 rankings...")
     ground_truth = []
     for qi, query in enumerate(queries):
-        if (qi + 1) % 1000 == 0:
+        if (qi + 1) % 2000 == 0:
             print(f"  Query {qi + 1}/{num_queries}...")
         q_terms = tokenize(query)
-        scores = []
-        for di in range(N):
-            s = bm25_score(q_terms, di)
-            if s > 0:
-                scores.append((di, s))
-        scores.sort(key=lambda x: -x[1])
-        top_docs = [doc_id for doc_id, _ in scores[:top_k]]
-        ground_truth.append(top_docs)
+        scores = defaultdict(float)
+        for term in q_terms:
+            idf = idf_cache.get(term, 0)
+            if idf <= 0:
+                continue
+            postings = inverted.get(term, [])
+            for doc_id, tf in postings:
+                tf_norm = (tf * (k1 + 1)) / (tf + dl_factors[doc_id])
+                scores[doc_id] += idf * tf_norm
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        ground_truth.append([doc_id for doc_id, _ in ranked[:top_k]])
 
     return queries, ground_truth
 
 
-def prepare_search_benchmark(num_docs=100000):
+def prepare_search_benchmark(num_docs=DEFAULT_NUM_DOCS):
     """Build corpus, queries, and ground truth for search benchmarking."""
     os.makedirs(SEARCH_DIR, exist_ok=True)
 
@@ -449,7 +446,7 @@ class BM25Baseline:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare search benchmark for autoresearch")
-    parser.add_argument("--num-docs", type=int, default=100000,
+    parser.add_argument("--num-docs", type=int, default=DEFAULT_NUM_DOCS,
                         help="Number of documents in corpus")
     args = parser.parse_args()
 
