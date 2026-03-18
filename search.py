@@ -26,21 +26,27 @@ from prepare_search import (
 BM25_K1 = 1.2
 BM25_B = 0.75
 
+# Impact-ordered posting truncation
+# Keep only the top MAX_POSTINGS entries per term (sorted by score desc)
+# This trades a tiny recall loss for massive speedup on long posting lists
+MAX_POSTINGS = 2000  # truncate posting lists longer than this
+
 
 class FastSearchEngine:
     """
-    High-throughput BM25 with precomputed scores and tuple postings.
+    High-throughput BM25 with impact-ordered truncated postings.
 
     Optimizations:
     1. Precomputed idf * tf_norm stored as (doc_id, score) tuples
-    2. Persistent flat array accumulator (no per-query allocation)
-    3. Tuple unpacking in for loop (faster than zip of two lists)
-    4. Adaptive top-K extraction
+    2. Impact-ordered posting lists (sorted by score descending)
+    3. Posting lists truncated to MAX_POSTINGS (skip low-scoring tail)
+    4. Persistent flat array accumulator (no per-query allocation)
+    5. Adaptive top-K extraction
     """
 
     def __init__(self):
         self.N = 0
-        self.postings = {}    # term -> list of (doc_id, score) tuples
+        self.postings = {}
         self._scores = None
         self._touched = None
 
@@ -65,7 +71,7 @@ class FastSearchEngine:
 
         avgdl = total_len / self.N if self.N > 0 else 1.0
 
-        # Precompute BM25 partial scores as tuples
+        # Precompute BM25 partial scores, sort by score desc, truncate
         N = self.N
         postings = {}
         for term, posts in raw_postings.items():
@@ -78,6 +84,10 @@ class FastSearchEngine:
                 dl = doc_lens[doc_id]
                 tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
                 scored.append((doc_id, idf * tf_norm))
+            # Sort by score descending and truncate
+            if len(scored) > MAX_POSTINGS:
+                scored.sort(key=lambda x: x[1], reverse=True)
+                scored = scored[:MAX_POSTINGS]
             postings[term] = scored
         self.postings = postings
 
