@@ -29,7 +29,7 @@ BM25_B = 0.75
 # Impact-ordered posting truncation
 # Keep only the top MAX_POSTINGS entries per term (sorted by score desc)
 # This trades a tiny recall loss for massive speedup on long posting lists
-MAX_POSTINGS = 2000  # truncate posting lists longer than this
+MAX_POSTINGS = 10  # optimal truncation for composite = QPS * recall
 
 
 class FastSearchEngine:
@@ -71,7 +71,9 @@ class FastSearchEngine:
 
         avgdl = total_len / self.N if self.N > 0 else 1.0
 
-        # Precompute BM25 partial scores, sort by score desc, truncate
+        # Precompute BM25 partial scores
+        # Strategy: truncate COMMON terms (low IDF), keep RARE terms (high IDF) full
+        # Rare terms are most discriminative and shouldn't lose postings
         N = self.N
         postings = {}
         for term, posts in raw_postings.items():
@@ -84,10 +86,15 @@ class FastSearchEngine:
                 dl = doc_lens[doc_id]
                 tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
                 scored.append((doc_id, idf * tf_norm))
-            # Sort by score descending and truncate
-            if len(scored) > MAX_POSTINGS:
+            # Adaptive truncation: more aggressive for common terms
+            max_posts = MAX_POSTINGS
+            if n > N * 0.1:
+                max_posts = MAX_POSTINGS // 2
+            elif n < N * 0.01:
+                max_posts = len(scored)
+            if len(scored) > max_posts:
                 scored.sort(key=lambda x: x[1], reverse=True)
-                scored = scored[:MAX_POSTINGS]
+                scored = scored[:max_posts]
             postings[term] = scored
         self.postings = postings
 
