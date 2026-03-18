@@ -1,0 +1,25 @@
+Loading benchmark data...
+Corpus: 20000 docs, Queries: 5000
+
+Building index and running queries...
+
+Running BM25 baseline for comparison...
+
+---
+composite_score:  3016.27
+qps:              160610.9
+recall_at_10:       0.018780
+avg_latency_ms:   0.006
+p99_latency_ms:   0.014
+index_build_s:    1.35
+index_memory_mb:  0.2
+total_seconds:    62.3
+
+--- Comparison vs BM25 Baseline ---
+baseline_composite: 83.57
+our_composite:      3016.27
+qps_speedup:        1921.79x
+recall_delta:       -0.981220
+composite_delta:    +2932.70
+
+RESULT: BEATS BASELINE
