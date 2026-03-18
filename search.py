@@ -72,7 +72,9 @@ class FastSearchEngine:
         avgdl = total_len / self.N if self.N > 0 else 1.0
 
         # Precompute full BM25 partial scores — use plain lists (fastest in CPython)
+        # Also store max score per term for MaxScore pruning
         N = self.N
+        self.term_max_score = {}  # term -> max score in its posting list
         for term, postings in raw_postings.items():
             n = df[term]
             idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
@@ -80,13 +82,18 @@ class FastSearchEngine:
                 continue
             doc_ids = []
             scores = []
+            max_sc = 0.0
             for doc_id, tf in postings:
                 dl = doc_lens[doc_id]
                 tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
+                sc = idf * tf_norm
                 doc_ids.append(doc_id)
-                scores.append(idf * tf_norm)
+                scores.append(sc)
+                if sc > max_sc:
+                    max_sc = sc
             self.posting_docs[term] = doc_ids
             self.posting_scores[term] = scores
+            self.term_max_score[term] = max_sc
 
         # Persistent accumulators
         self._scores = [0.0] * self.N
@@ -100,15 +107,28 @@ class FastSearchEngine:
         scores = self._scores
         touched = self._touched
 
-        # TAAT scoring — zip iteration runs at C speed in CPython
+        # Gather matching terms and sort by max_score descending
+        # Process high-impact terms first for better pruning potential
         posting_docs = self.posting_docs
         posting_scores = self.posting_scores
+        term_max = self.term_max_score
         touched_append = touched.append
+
+        matched_terms = []
         for term in query_terms:
-            doc_ids = posting_docs.get(term)
-            if doc_ids is None:
-                continue
-            for did, sc in zip(doc_ids, posting_scores[term]):
+            if term in posting_docs:
+                matched_terms.append(term)
+
+        if not matched_terms:
+            return []
+
+        # Sort terms: highest max-score first (process most impactful first)
+        if len(matched_terms) > 1:
+            matched_terms.sort(key=lambda t: term_max[t], reverse=True)
+
+        # TAAT scoring with zip
+        for term in matched_terms:
+            for did, sc in zip(posting_docs[term], posting_scores[term]):
                 if scores[did] == 0.0:
                     touched_append(did)
                 scores[did] += sc
@@ -116,13 +136,12 @@ class FastSearchEngine:
         if not touched:
             return []
 
-        # Top-K: use sorted for small sets, nlargest for large
+        # Top-K: adaptive strategy
         n_touched = len(touched)
         if n_touched <= top_k:
             touched.sort(key=lambda d: scores[d], reverse=True)
             result = list(touched)
         elif n_touched < top_k * 20:
-            # For moderately sized sets, full sort is faster than heapq
             touched.sort(key=lambda d: scores[d], reverse=True)
             result = touched[:top_k]
         else:
