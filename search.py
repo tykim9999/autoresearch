@@ -7,14 +7,11 @@ Goal: Beat the BM25 baseline on composite_score = QPS * recall@K.
 Usage: uv run search.py
 """
 
-import os
-import sys
 import math
 import time
-import struct
-import hashlib
+import heapq
+import array
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 
 from prepare_search import (
     TIME_BUDGET, TOP_K, tokenize,
@@ -26,138 +23,110 @@ from prepare_search import (
 # Search Algorithm (edit everything below)
 # ---------------------------------------------------------------------------
 
-# Hyperparameters
-BM25_K1 = 1.2          # BM25 term frequency saturation
-BM25_B = 0.75          # BM25 length normalization
-USE_SKIP_LISTS = True  # whether to use skip pointers in posting lists
-SKIP_INTERVAL = 64     # skip pointer interval
-PRESCORE_CUTOFF = 0    # if > 0, only score docs appearing in >= N query terms
-USE_TERM_CACHE = True  # cache top-K results for frequent query terms
-TERM_CACHE_SIZE = 1000 # max cached terms
+# BM25 hyperparameters
+BM25_K1 = 1.2
+BM25_B = 0.75
 
 
 class FastSearchEngine:
     """
-    Optimized search engine aiming to beat standard BM25 on throughput
-    while maintaining high recall.
+    High-throughput BM25 engine with precomputed partial scores.
 
-    Key optimizations over naive BM25:
-    1. Precomputed IDF values at index time
-    2. Posting lists sorted by doc_id for efficient intersection
-    3. Score accumulation with early termination
-    4. Compact data structures to reduce memory overhead
-    5. Term-at-a-time (TAAT) scoring with score upper bounds
+    Key optimizations:
+    1. Store precomputed idf * tf_norm in postings (no per-query math)
+    2. Flat array score accumulator (no dict overhead)
+    3. heapq.nlargest for top-K (avoids full sort)
+    4. Posting lists as parallel arrays (doc_ids + scores) for locality
+    5. Query term dedup to avoid redundant posting traversals
     """
 
     def __init__(self):
         self.N = 0
-        self.avgdl = 0.0
-        self.doc_lens = None
-        self.postings = {}       # term -> list of (doc_id, tf)
-        self.idf = {}            # term -> precomputed IDF
-        self.dl_cache = {}       # doc_id -> length normalization factor
-        self.term_cache = {}     # term -> sorted top doc_ids with scores
+        # Postings stored as: term -> (doc_id_array, score_array)
+        # where score = idf * tf_norm (fully precomputed)
+        self.posting_docs = {}    # term -> array('i', [...])
+        self.posting_scores = {}  # term -> array('f', [...])
 
     def build_index(self, docs):
         self.N = len(docs)
-        self.doc_lens = [0] * self.N
-        postings = defaultdict(list)
-        df = Counter()
+        k1, b = BM25_K1, BM25_B
 
-        # Single pass: tokenize, count, build postings
+        # Single pass: tokenize + build raw postings
+        raw_postings = defaultdict(list)  # term -> [(doc_id, tf)]
+        doc_lens = array.array('i', [0] * self.N)
+        df = Counter()
         total_len = 0
+
         for doc_id, doc in enumerate(docs):
             tokens = tokenize(doc)
             dl = len(tokens)
-            self.doc_lens[doc_id] = dl
+            doc_lens[doc_id] = dl
             total_len += dl
-
             tf = Counter(tokens)
             for term, count in tf.items():
                 df[term] += 1
-                postings[term].append((doc_id, count))
+                raw_postings[term].append((doc_id, count))
 
-        self.avgdl = total_len / self.N if self.N > 0 else 1.0
+        avgdl = total_len / self.N if self.N > 0 else 1.0
 
-        # Precompute IDF for all terms
-        for term, n in df.items():
-            self.idf[term] = math.log((self.N - n + 0.5) / (n + 0.5) + 1.0)
-
-        # Store postings sorted by doc_id (for cache-friendly access)
-        self.postings = {term: pl for term, pl in postings.items()}
-
-        # Precompute length normalization denominators
-        # dl_factor[doc_id] = k1 * (1 - b + b * dl / avgdl)
-        k1, b = BM25_K1, BM25_B
-        self.dl_factors = [
-            k1 * (1 - b + b * self.doc_lens[i] / self.avgdl)
-            for i in range(self.N)
-        ]
-
-        # Build term cache for high-IDF terms (most discriminative)
-        if USE_TERM_CACHE:
-            self._build_term_cache()
-
-    def _build_term_cache(self):
-        """Pre-score and cache top results for frequent terms."""
-        # Cache the most common terms' full scored results
-        term_by_freq = sorted(self.postings.keys(),
-                              key=lambda t: len(self.postings[t]),
-                              reverse=True)
-        k1 = BM25_K1
-        for term in term_by_freq[:TERM_CACHE_SIZE]:
-            idf = self.idf.get(term, 0)
+        # Precompute full BM25 partial scores into posting lists
+        N = self.N
+        for term, postings in raw_postings.items():
+            n = df[term]
+            idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
             if idf <= 0:
                 continue
-            scored = []
-            for doc_id, tf in self.postings[term]:
-                tf_norm = (tf * (k1 + 1)) / (tf + self.dl_factors[doc_id])
-                scored.append((doc_id, idf * tf_norm))
-            scored.sort(key=lambda x: -x[1])
-            self.term_cache[term] = scored[:TOP_K * 5]  # keep more than top_k for multi-term queries
+            doc_ids = array.array('i')
+            scores = array.array('f')
+            for doc_id, tf in postings:
+                dl = doc_lens[doc_id]
+                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
+                doc_ids.append(doc_id)
+                scores.append(idf * tf_norm)
+            self.posting_docs[term] = doc_ids
+            self.posting_scores[term] = scores
 
     def search(self, query, top_k=10):
-        query_terms = tokenize(query)
+        query_terms = set(tokenize(query))  # dedup
         if not query_terms:
             return []
 
-        # Score accumulator: doc_id -> score
-        scores = defaultdict(float)
-        k1 = BM25_K1
+        # Flat array accumulator - much faster than defaultdict for dense scoring
+        scores = [0.0] * self.N
+        touched = []  # track which doc_ids got scores
 
-        # Term-at-a-time scoring
         for term in query_terms:
-            idf = self.idf.get(term, 0)
-            if idf <= 0:
+            doc_ids = self.posting_docs.get(term)
+            if doc_ids is None:
                 continue
+            score_arr = self.posting_scores[term]
+            n = len(doc_ids)
+            for i in range(n):
+                did = doc_ids[i]
+                if scores[did] == 0.0:
+                    touched.append(did)
+                scores[did] += score_arr[i]
 
-            posting_list = self.postings.get(term)
-            if posting_list is None:
-                continue
-
-            for doc_id, tf in posting_list:
-                tf_norm = (tf * (k1 + 1)) / (tf + self.dl_factors[doc_id])
-                scores[doc_id] += idf * tf_norm
-
-        if not scores:
+        if not touched:
             return []
 
-        # Partial sort: only need top_k
-        if len(scores) <= top_k:
-            ranked = sorted(scores.items(), key=lambda x: -x[1])
+        # Extract top-k using nlargest (O(n log k) vs O(n log n) for sort)
+        if len(touched) <= top_k:
+            touched.sort(key=lambda d: scores[d], reverse=True)
+            result = touched
         else:
-            # Use a selection approach for large result sets
-            items = list(scores.items())
-            items.sort(key=lambda x: -x[1])
-            ranked = items[:top_k]
+            result = heapq.nlargest(top_k, touched, key=lambda d: scores[d])
 
-        return [doc_id for doc_id, _ in ranked]
+        # Reset accumulator for touched docs
+        for did in touched:
+            scores[did] = 0.0
+
+        return result
 
     def memory_usage_mb(self):
-        total_postings = sum(len(v) for v in self.postings.values())
-        total_terms = len(self.postings)
-        cache_entries = sum(len(v) for v in self.term_cache.values())
-        return (total_postings * 24 + total_terms * 80 + self.N * 16 + cache_entries * 16) / (1024 * 1024)
+        total_postings = sum(len(v) for v in self.posting_docs.values())
+        total_terms = len(self.posting_docs)
+        return (total_postings * 8 + total_terms * 80 + self.N * 8) / (1024 * 1024)
 
 
 # ---------------------------------------------------------------------------
