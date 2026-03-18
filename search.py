@@ -42,18 +42,20 @@ class FastSearchEngine:
 
     def __init__(self):
         self.N = 0
-        # Postings stored as: term -> (doc_id_array, score_array)
-        # where score = idf * tf_norm (fully precomputed)
-        self.posting_docs = {}    # term -> array('i', [...])
-        self.posting_scores = {}  # term -> array('f', [...])
+        # Postings: term -> (doc_ids_list, scores_list)
+        # Scores = precomputed idf * tf_norm
+        self.posting_docs = {}
+        self.posting_scores = {}
+        self._scores = None   # persistent accumulator
+        self._touched = None  # persistent touched list
 
     def build_index(self, docs):
         self.N = len(docs)
         k1, b = BM25_K1, BM25_B
 
         # Single pass: tokenize + build raw postings
-        raw_postings = defaultdict(list)  # term -> [(doc_id, tf)]
-        doc_lens = array.array('i', [0] * self.N)
+        raw_postings = defaultdict(list)
+        doc_lens = [0] * self.N
         df = Counter()
         total_len = 0
 
@@ -69,15 +71,15 @@ class FastSearchEngine:
 
         avgdl = total_len / self.N if self.N > 0 else 1.0
 
-        # Precompute full BM25 partial scores into posting lists
+        # Precompute full BM25 partial scores — use plain lists (fastest in CPython)
         N = self.N
         for term, postings in raw_postings.items():
             n = df[term]
             idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
             if idf <= 0:
                 continue
-            doc_ids = array.array('i')
-            scores = array.array('f')
+            doc_ids = []
+            scores = []
             for doc_id, tf in postings:
                 dl = doc_lens[doc_id]
                 tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
@@ -86,22 +88,25 @@ class FastSearchEngine:
             self.posting_docs[term] = doc_ids
             self.posting_scores[term] = scores
 
+        # Persistent accumulators
+        self._scores = [0.0] * self.N
+        self._touched = []
+
     def search(self, query, top_k=10):
-        query_terms = set(tokenize(query))  # dedup
+        query_terms = set(tokenize(query))
         if not query_terms:
             return []
 
-        # Flat array accumulator - much faster than defaultdict for dense scoring
-        scores = [0.0] * self.N
-        touched = []  # track which doc_ids got scores
+        scores = self._scores
+        touched = self._touched
 
+        # TAAT scoring with persistent accumulator
         for term in query_terms:
             doc_ids = self.posting_docs.get(term)
             if doc_ids is None:
                 continue
             score_arr = self.posting_scores[term]
-            n = len(doc_ids)
-            for i in range(n):
+            for i in range(len(doc_ids)):
                 did = doc_ids[i]
                 if scores[did] == 0.0:
                     touched.append(did)
@@ -110,16 +115,22 @@ class FastSearchEngine:
         if not touched:
             return []
 
-        # Extract top-k using nlargest (O(n log k) vs O(n log n) for sort)
-        if len(touched) <= top_k:
+        # Top-K: use sorted for small sets, nlargest for large
+        n_touched = len(touched)
+        if n_touched <= top_k:
             touched.sort(key=lambda d: scores[d], reverse=True)
-            result = touched
+            result = list(touched)
+        elif n_touched < top_k * 20:
+            # For moderately sized sets, full sort is faster than heapq
+            touched.sort(key=lambda d: scores[d], reverse=True)
+            result = touched[:top_k]
         else:
             result = heapq.nlargest(top_k, touched, key=lambda d: scores[d])
 
-        # Reset accumulator for touched docs
+        # Sparse reset
         for did in touched:
             scores[did] = 0.0
+        touched.clear()
 
         return result
 
