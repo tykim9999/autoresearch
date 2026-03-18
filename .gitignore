@@ -10,16 +10,20 @@ wheels/
 .venv
 worktrees/
 
-# Agent prompt files
+# Agent prompt files (generated per-session by launchers)
 CLAUDE.md
 AGENTS.md
 
-# Model checkpoints and results
+# Experimental code/artifacts
+dev/
 checkpoints/
 results/
 
+# Results file
+results.tsv
+
 # Logs
-*.log
+run.log
 
 # Data cache
 .cache/
