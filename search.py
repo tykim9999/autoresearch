@@ -100,17 +100,18 @@ class FastSearchEngine:
         scores = self._scores
         touched = self._touched
 
-        # TAAT scoring with persistent accumulator
+        # TAAT scoring — zip iteration runs at C speed in CPython
+        posting_docs = self.posting_docs
+        posting_scores = self.posting_scores
+        touched_append = touched.append
         for term in query_terms:
-            doc_ids = self.posting_docs.get(term)
+            doc_ids = posting_docs.get(term)
             if doc_ids is None:
                 continue
-            score_arr = self.posting_scores[term]
-            for i in range(len(doc_ids)):
-                did = doc_ids[i]
+            for did, sc in zip(doc_ids, posting_scores[term]):
                 if scores[did] == 0.0:
-                    touched.append(did)
-                scores[did] += score_arr[i]
+                    touched_append(did)
+                scores[did] += sc
 
         if not touched:
             return []
