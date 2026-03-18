@@ -1,91 +1,92 @@
-# autoresearch
+# Stock Price Prediction — NVDA & SK Hynix
 
-![teaser](progress.png)
+Predict stock prices **10 minutes ahead** for NVIDIA (NVDA) and SK Hynix (000660.KS) using deep learning (LSTM / Transformer).
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+## How It Works
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
+1. **Data**: Fetches real-time and historical intraday data via `yfinance`
+2. **Features**: 30+ technical indicators (RSI, MACD, Bollinger Bands, moving averages, momentum, volatility, etc.)
+3. **Model**: LSTM with attention mechanism (or Transformer) trained on sliding window sequences
+4. **Prediction**: Outputs the predicted price 10 minutes from now
 
-## How it works
-
-The repo is deliberately kept small and only really has three files that matter:
-
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
-
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
-
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
-
-## Quick start
-
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+## Quick Start
 
 ```bash
-
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
+# Install dependencies
 uv sync
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
+# Train and predict both stocks
+uv run predict.py
 
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# Predict NVDA only
+uv run predict.py --ticker NVDA
+
+# Predict SK Hynix only
+uv run predict.py --ticker HYNIX
+
+# Use Transformer model instead of LSTM
+uv run predict.py --model transformer
+
+# Use 1-minute interval data (less history, more granular)
+uv run predict.py --interval 1m
+
+# Live prediction mode (refreshes every 60s)
+uv run predict.py --ticker NVDA --live
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
-
-## Running the agent
-
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+## Project Structure
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+predict.py       — Main script: train, evaluate, predict, live mode
+model.py         — LSTM (with attention) and Transformer model definitions
+data_fetcher.py  — Data fetching, technical indicators, feature engineering
+pyproject.toml   — Dependencies
+checkpoints/     — Saved model weights (auto-created)
+results/         — Prediction plots and live logs (auto-created)
 ```
 
-The `program.md` file is essentially a super lightweight "skill".
+## Models
 
-## Project structure
+### LSTM with Attention
+- 3-layer LSTM with attention mechanism over time steps
+- Best for capturing sequential patterns in price movements
+- Default model (`--model lstm`)
 
-```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
-```
+### Transformer
+- Positional encoding + multi-head self-attention
+- Alternative architecture (`--model transformer`)
 
-## Design choices
+## Features Used
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+| Category | Features |
+|----------|----------|
+| Price | Open, High, Low, Close, returns, log returns |
+| Moving Averages | SMA(5,10,20,50), EMA(5,10,20), close-to-SMA ratios |
+| Momentum | RSI(14), MACD, momentum(1,5,10) |
+| Volatility | Bollinger Bands, rolling std(10,20), high-low range |
+| Volume | Raw volume, volume SMA(10), volume ratio |
 
-## Platform support
+## Output
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+After training, you get:
+- **Console**: Prediction summary with current price, predicted price, direction accuracy
+- **Plots**: Saved to `results/` — predicted vs actual, error analysis
+- **Checkpoints**: Saved to `checkpoints/` — reusable model weights
 
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
+## Tickers
 
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
+| Name | Symbol | Exchange |
+|------|--------|----------|
+| NVIDIA | NVDA | NASDAQ |
+| SK Hynix | 000660.KS | Korea Exchange (KRX) |
 
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+## Notes
 
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
+- Market hours matter: predictions are most useful during active trading
+- The model predicts **percentage change**, then converts to price
+- Direction accuracy > 55% is considered meaningful for short-term prediction
+- Uses Huber loss for robustness to outliers
+- Early stopping with patience=10 to prevent overfitting
 
 ## License
 

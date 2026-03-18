@@ -9,15 +9,17 @@ wheels/
 # Virtual environments
 .venv
 worktrees/
-results/
-queue/
 
-# Agent prompt files (generated per-session by launchers)
+# Agent prompt files
 CLAUDE.md
 AGENTS.md
 
-# Experimental code/artifacts
-dev/
+# Model checkpoints and results
+checkpoints/
+results/
 
-# Results file
-results.tsv
+# Logs
+*.log
+
+# Data cache
+.cache/
